@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  StorageS3Bucket:
+    Type: AWS::S3::Bucket
+
+  RequesterPaysLambdaFunctionIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildProjectIAMRolePolicyName
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutBucketRequestPayment
+                Resource: !GetAtt StorageS3Bucket.Arn
+
+  RequesterPaysLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const { S3 } = require('aws-sdk');
+          const { send, SUCCESS, FAILED } = require('cfn-response');
+          const s3 = new S3();
+          exports.handler = async (event, context) => {
+            try {
+              const { RequestType } = event;
+              if (RequestType === 'Delete') {
+                return send(event, context, SUCCESS);
+              }            
+              const params = {
+                Bucket: process.env.BUCKET, 
+                RequestPaymentConfiguration: {
+                  Payer: "Requester"
+                }
+              };
+              await s3.putBucketRequestPayment(params).promise();
+              return send(event, context, SUCCESS);
+            } catch(err) {
+              console.error(err);
+              return send(event, context, FAILED, err);
+            }
+          }
+      Environment:
+        Variables:
+          BUCKET: !Ref StorageS3Bucket
+      Handler: index.handler
+      Role: !GetAtt RequesterPaysLambdaFunctionIAMRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 5
+
+  CustomRequesterPays:
+    Type: Custom::RequesterPays
+    Properties:
+      ServiceToken: !GetAtt RequesterPaysLambdaFunction.Arn
+
+  CodeBuildProjectIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildProjectIAMRolePolicyName
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: logs:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Join ['/', [!GetAtt StorageS3Bucket.Arn, 'packages', '*']]
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        # ArtifactIdentifier: String
+        # EncryptionDisabled: Boolean
+        # Location: String
+        # Name: String
+        # NamespaceType: String
+        # OverrideArtifactName: Boolean
+        # Packaging: String
+        # Path: String
+        Type: NO_ARTIFACTS
+      # BadgeEnabled: Boolean
+      # BuildBatchConfig:
+      #   ProjectBuildBatchConfig
+      # Cache:
+      #   ProjectCache
+      # Description: String
+      # EncryptionKey: String
+      Environment:
+        # Certificate: String
+        ComputeType: BUILD_GENERAL1_SMALL
+        # EnvironmentVariables:
+        #   - EnvironmentVariable
+        Image: aws/codebuild/standard:4.0
+        ImagePullCredentialsType: CODEBUILD
+        # PrivilegedMode: Boolean
+        # RegistryCredential:
+        #   RegistryCredential
+        Type: LINUX_CONTAINER
+      # FileSystemLocations:
+      #   - ProjectFileSystemLocation
+      LogsConfig:
+        CloudWatchLogs:
+          # GroupName: String
+          Status: ENABLED
+          # StreamName: String
+        # S3Logs:
+        #   S3LogsConfig
+      # Name: String
+      # QueuedTimeoutInMinutes: Integer
+      # SecondaryArtifacts:
+      #   - Artifacts
+      # SecondarySources:
+      #   - Source
+      # SecondarySourceVersions:
+      #   - ProjectSourceVersion
+      ServiceRole: !GetAtt CodeBuildProjectIAMRole.Arn
+      Source:
+        # Auth:
+        #   SourceAuth
+        BuildSpec: !Sub
+          - |
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  nodejs: 12.x
+                commands:
+                  - DIR=$(echo $PACKAGE | tr @ a | tr . d)
+                  - echo $DIR
+                  - mkdir $DIR
+                  - cd $DIR
+                  - npm init -y
+                  - npm i --save --no-package-lock --no-optional --only=prod $PACKAGE
+              pre_build:
+                commands:
+                  - mkdir nodejs
+                  # https://docs.aws.amazon.com/lambda/latest/dg/configuration-layers.html#configuration-layers-path
+                  - mv node_modules nodejs/node_modules
+              build:
+                commands:
+                  - zip -r $PACKAGE.zip nodejs
+                  - ls
+              post_build:
+                commands:
+                  - aws s3 mv $PACKAGE.zip ${S3Uri}/packages/12.x/$PACKAGE.zip
+          - S3Uri: !Join ['', ['s3://', !Ref StorageS3Bucket]]
+        # BuildStatusConfig:
+        #   BuildStatusConfig
+        # GitCloneDepth: Integer
+        # GitSubmodulesConfig:
+        #   GitSubmodulesConfig
+        # InsecureSsl: Boolean
+        # Location: String
+        # ReportBuildStatus: Boolean
+        # SourceIdentifier: String
+        Type: NO_SOURCE
+      SourceVersion: String
+      # Tags:
+      #   - Tag
+      TimeoutInMinutes: 300
+      # Triggers: ProjectTriggers
+      # VpcConfig:
+      #   VpcConfig
+
+  ApiV1ServerlessApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: SHARED
+      StageName: v1
+
+  ApiV1ServerlessFunctionIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: ApiV1ServerlessFunctionIAMRolePolicyName
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt StorageS3Bucket.Arn
+                  - !Join ['/', [!GetAtt StorageS3Bucket.Arn, '*']]
+
+  ApiV1ServerlessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Environment:
+        Variables:
+          BUCKET: !Ref StorageS3Bucket
+          CODE_BUILD_PROJECT_NAME: !Ref CodeBuildProject
+      Events:
+        GetPackageEvent:
+          Type: Api
+          Properties:
+            Auth:
+              ApiKeyRequired: false
+            Method: GET
+            Path: /package/{runtime}/{package}
+            RestApiId: !Ref ApiV1ServerlessApi
+        GetPackagesEvent:
+          Type: Api
+          Properties:
+            Auth:
+              ApiKeyRequired: false
+            Method: GET
+            Path: /packages
+            RestApiId: !Ref ApiV1ServerlessApi
+        PostPackageEvent:
+          Type: Api
+          Properties:
+            Method: POST
+            Path: /package
+            RestApiId: !Ref ApiV1ServerlessApi
+      Handler: index.proxyHandler
+      InlineCode: |
+        const { CodeBuild, S3} = require("aws-sdk");
+        const codeBuild = new CodeBuild();
+        const s3 = new S3();
+        exports.proxyHandler = async (event) => {
+          try {
+            if(event.resource === "/package" && event.httpMethod === "POST") {
+              const { package } = JSON.parse(event.body);
+              const params = {
+                projectName: process.env.CODE_BUILD_PROJECT_NAME,
+                environmentVariablesOverride: [
+                  {
+                    name: "PACKAGE",
+                    value: package,
+                    type: "PLAINTEXT"
+                  },
+                ],
+              };
+              const response = await codeBuild.startBuild(params).promise();
+              return {
+                statusCode: 200,
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify(response)
+              }
+            };
+            if(event.resource === "/packages" && event.httpMethod === "GET") {
+              const params = {
+                Bucket: process.env.BUCKET,
+                Prefix: "packages",
+              };
+              const response = await s3.listObjectsV2(params).promise();
+              return {
+                statusCode: 200,
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify(response)
+              }
+            }
+            if(event.resource === "/package/{runtime}/{package}" && event.httpMethod === "GET") {
+              try {
+                const { pathParameters: { runtime, package } } = event;
+                const params = {
+                  Bucket: process.env.BUCKET,
+                  Key: `packages/${runtime}/${package}.zip`,
+                };              
+                const response = await s3.headObject(params).promise();
+                return {
+                  statusCode: 200,
+                  headers: {
+                    "Content-Type": "application/json"
+                  },
+                  body: JSON.stringify(response)
+                }
+              } catch {
+                return {
+                  statusCode: 404
+                }
+              }
+            }
+            return {
+              statusCode: 400
+            };
+          } catch(err) {
+            console.error(err);
+            return {
+              statusCode: 400,
+              body: err.message,
+            }; 
+          }
+        }
+      Role: !GetAtt ApiV1ServerlessFunctionIAMRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 600
+
+Outputs:
+  ApiV1Endpoint:
+    Description: 'API v1 stage endpoint.'
+    Value: !Sub 'https://${ApiV1ServerlessApi}.execute-api.${AWS::Region}.amazonaws.com/v1/'

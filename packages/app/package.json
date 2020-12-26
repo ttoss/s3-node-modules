@@ -1,0 +1,11 @@
+{
+  "name": "s3-node-modules-app",
+  "version": "0.0.1",
+  "description": "",
+  "scripts": {
+    "deploy": "carlin deploy"
+  },
+  "keywords": [],
+  "author": "Pedro Arantes <arantespp@gmail.com> (https://twitter.com/arantespp)",
+  "license": "MIT"
+}
